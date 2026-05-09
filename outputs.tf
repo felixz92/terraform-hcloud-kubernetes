@@ -102,3 +102,8 @@ output "kube_api_load_balancer" {
     private_ipv4 = local.kube_api_load_balancer_private_ipv4
   } : null
 }
+
+output "talos_certificate_san" {
+  description = "The certificate SAN for usage in external servers"
+  value = local.talos_certificate_san
+}

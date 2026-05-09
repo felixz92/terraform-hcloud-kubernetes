@@ -2086,3 +2086,8 @@ variable "prometheus_operator_crds_version" {
   default     = "v0.90.1" # https://github.com/prometheus-operator/prometheus-operator
   description = "Specifies the version of the Prometheus Operator Custom Resource Definitions (CRDs) to deploy."
 }
+
+variable "on_prem_worker_ipv4_list" {
+  type        = list(string)
+  default = []
+}
