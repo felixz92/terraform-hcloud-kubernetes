@@ -107,3 +107,13 @@ output "talos_certificate_san" {
   description = "The certificate SAN for usage in external servers"
   value = local.talos_certificate_san
 }
+
+output "network_service_ipv4_cidr" {
+  description = "Kubernetes service CIDR for IPv4"
+  value       = local.network_service_ipv4_cidr
+}
+
+output "network_pod_ipv4_cidr" {
+  description = "Kubernetes pod CIDR for IPv4"
+  value       = local.network_pod_ipv4_cidr
+}
