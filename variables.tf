@@ -1617,6 +1617,11 @@ variable "cilium_bpf_datapath_mode" {
   }
 }
 
+variable "cilium_host_legacy_routing_enabled" {
+  type = bool
+  default = false
+}
+
 variable "cilium_gateway_api_enabled" {
   type        = bool
   default     = false
