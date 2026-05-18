@@ -118,23 +118,10 @@ output "network_pod_ipv4_cidr" {
   value       = local.network_pod_ipv4_cidr
 }
 
-output "network_node_ipv4_cidr" {
-  description = "Kubernetes node CIDR for IPv4"
-  value       = local.network_node_ipv4_cidr
+output "network_subnet_load_balancer_id" {
+  value = hcloud_network_subnet.load_balancer.id
 }
 
-output "hcloud_network_id" {
-  value = local.hcloud_network_id
-}
-
-output "hcloud_network_zone" {
-  value = local.hcloud_network_zone
-}
-
-output "network_node_ipv4_subnet_mask_size" {
-  value = local.network_node_ipv4_subnet_mask_size
-}
-
-output "network_node_ipv4_cidr_skip_first_subnet" {
-  value = local.network_node_ipv4_cidr_skip_first_subnet
+output "network_subnet_load_balancer_ip_range" {
+  value = hcloud_network_subnet.load_balancer.ip_range
 }
