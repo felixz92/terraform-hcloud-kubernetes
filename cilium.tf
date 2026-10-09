@@ -1,4 +1,6 @@
 locals {
+  cilium_routing_mode = coalesce(var.cilium_routing_mode, local.bare_metal_enabled ? "tunnel" : "native")
+
   # Cilium IPSec Configuration
   cilium_ipsec_enabled = var.cilium_encryption_enabled && var.cilium_encryption_type == "ipsec"
 
@@ -56,13 +58,13 @@ data "helm_template" "cilium" {
       ipam = {
         mode = "kubernetes"
       }
-      routingMode           = var.cilium_routing_mode
+      routingMode           = local.cilium_routing_mode
       ipv4NativeRoutingCIDR = local.network_native_routing_ipv4_cidr
       policyCIDRMatchMode   = var.cilium_policy_cidr_match_mode
       bpf = {
         masquerade        = var.cilium_kube_proxy_replacement_enabled
         datapathMode      = var.cilium_bpf_datapath_mode
-        hostLegacyRouting = var.cilium_host_legacy_routing_enabled || local.cilium_ipsec_enabled
+        hostLegacyRouting = coalesce(var.cilium_bpf_host_legacy_routing, local.cilium_ipsec_enabled)
       }
       encryption = {
         enabled = var.cilium_encryption_enabled
@@ -75,7 +77,7 @@ data "helm_template" "cilium" {
       k8sServicePort                      = local.kube_prism_port
       kubeProxyReplacement                = var.cilium_kube_proxy_replacement_enabled
       kubeProxyReplacementHealthzBindAddr = var.cilium_kube_proxy_replacement_enabled ? "0.0.0.0:10256" : ""
-      installNoConntrackIptablesRules     = var.cilium_kube_proxy_replacement_enabled && var.cilium_routing_mode == "native"
+      installNoConntrackIptablesRules     = var.cilium_kube_proxy_replacement_enabled && local.cilium_routing_mode == "native"
       socketLB = {
         hostNamespaceOnly = var.cilium_socket_lb_host_namespace_only_enabled
       }

@@ -154,7 +154,7 @@ variable "network_pod_ipv4_cidr" {
 variable "network_native_routing_ipv4_cidr" {
   type        = string
   default     = null
-  description = "Specifies the IPv4 CIDR block that the CNI assumes will be routed natively by the underlying network infrastructure without the need for SNAT."
+  description = "Specifies the IPv4 CIDR block that the CNI assumes will be routed natively by the underlying network infrastructure without the need for SNAT. When omitted, this defaults to network_pod_ipv4_cidr if bare metal servers are enabled, otherwise network_ipv4_cidr."
 }
 
 
@@ -168,7 +168,7 @@ variable "firewall_use_current_ipv4" {
 variable "firewall_use_current_ipv6" {
   type        = bool
   default     = null
-  description = "Determines whether the current IPv6 /64 CIDR is used for Talos and Kube API firewall rules. If `cluster_access` is set to `public`, the default is true."
+  description = "Determines whether the current IPv6 /64 CIDR is used for Talos and Kube API firewall rules. Set to true to require IPv6 or false to disable it. When omitted, IPv6 is used only if it is detected automatically."
 }
 
 variable "firewall_extra_rules" {
@@ -371,6 +371,7 @@ variable "worker_nodepools" {
     annotations     = optional(map(string), {})
     taints          = optional(list(string), [])
     count           = optional(number, 1)
+    subnet          = optional(string)
     rdns            = optional(string)
     rdns_ipv4       = optional(string)
     rdns_ipv6       = optional(string)
@@ -409,6 +410,22 @@ variable "worker_nodepools" {
   }
 
   validation {
+    condition = length([
+      for np in var.worker_nodepools : np.subnet if np.subnet != null
+      ]) == length(distinct([
+        for np in var.worker_nodepools : np.subnet if np.subnet != null
+    ]))
+    error_message = "Worker nodepool subnets must be unique."
+  }
+
+  validation {
+    condition = alltrue([
+      for np in var.worker_nodepools : np.subnet == null || contains(local.network_pinned_worker_ipv4_cidrs, np.subnet)
+    ])
+    error_message = "Worker nodepool subnet must be one of the calculated pinned worker subnets."
+  }
+
+  validation {
     condition = alltrue([
       for np in var.worker_nodepools : np.rdns == null || can(regex("^(?:(?:[a-z0-9{} ](?:[a-z0-9-{} ]{0,61}[a-z0-9{} ])?\\.)*(?:[a-z0-9{} ](?:[a-z0-9-{} ]{0,61}[a-z0-9{} ])?))$", np.rdns))
     ])
@@ -436,6 +453,135 @@ variable "worker_config_patches" {
   description = "List of configuration patches applied to the Worker nodes."
 }
 
+variable "bare_metal_config_patches" {
+  type        = any
+  default     = []
+  description = "List of configuration patches applied to the bare metal Worker nodes."
+}
+
+variable "bare_metal_nodepools" {
+  type = list(object({
+    name         = string
+    architecture = optional(string, "amd64")
+    servers = list(object({
+      number       = number
+      private_ipv4 = string
+      install_disk = optional(string)
+    }))
+    labels      = optional(map(string), {})
+    annotations = optional(map(string), {})
+    taints      = optional(list(string), [])
+    rdns        = optional(string)
+    rdns_ipv4   = optional(string)
+    rdns_ipv6   = optional(string)
+  }))
+  default     = []
+  description = "Defines configuration settings for Hetzner bare metal Worker node pools."
+
+  validation {
+    condition     = length(var.bare_metal_nodepools) == length(distinct([for np in var.bare_metal_nodepools : np.name]))
+    error_message = "Bare metal nodepool names must be unique to avoid configuration conflicts."
+  }
+
+  validation {
+    condition     = length(var.bare_metal_nodepools) == 0 || (var.hcloud_robot_user != null && var.hcloud_robot_password != null)
+    error_message = "hcloud_robot_user and hcloud_robot_password must be set when bare metal nodepools are configured."
+  }
+
+  validation {
+    condition = alltrue([
+      for np in var.bare_metal_nodepools : contains(["amd64", "arm64"], np.architecture)
+    ])
+    error_message = "Bare metal nodepool architecture must be one of: amd64, arm64."
+  }
+
+  validation {
+    condition = length(flatten([
+      for np in var.bare_metal_nodepools : [for server in np.servers : server.number]
+      ])) == length(distinct(flatten([
+        for np in var.bare_metal_nodepools : [for server in np.servers : server.number]
+    ])))
+    error_message = "Bare metal server numbers must be unique to avoid configuration conflicts."
+  }
+
+  validation {
+    condition = length(flatten([
+      for np in var.bare_metal_nodepools : [for server in np.servers : server.private_ipv4]
+      ])) == length(distinct(flatten([
+        for np in var.bare_metal_nodepools : [for server in np.servers : server.private_ipv4]
+    ])))
+    error_message = "Bare metal server private IPv4 addresses must be unique to avoid configuration conflicts."
+  }
+
+  validation {
+    condition = alltrue(flatten([
+      for np in var.bare_metal_nodepools : [
+        for server in np.servers : can(cidrhost("${server.private_ipv4}/32", 0))
+      ]
+    ]))
+    error_message = "Bare metal server private_ipv4 values must be valid IPv4 addresses."
+  }
+
+  validation {
+    condition = alltrue(flatten([
+      for np in var.bare_metal_nodepools : [
+        for server in np.servers : server.install_disk == null || can(regex("^[0-9A-Za-z#+.:=@_-]+$", server.install_disk))
+      ]
+    ]))
+    error_message = "Bare metal server install_disk values must be disk IDs from /dev/disk/by-id and match ^[0-9A-Za-z#+.:=@_-]+$."
+  }
+
+  validation {
+    condition = alltrue(flatten([
+      for np in var.bare_metal_nodepools : [
+        for server in np.servers : try(cidrcontains(local.network_bare_metal_shared_ipv4_cidr, server.private_ipv4), false)
+      ]
+    ]))
+    error_message = "Bare metal server private_ipv4 values must be inside the shared bare metal subnet."
+  }
+
+  validation {
+    condition = alltrue(flatten([
+      for np in var.bare_metal_nodepools : [
+        for server in np.servers : !contains([
+          cidrhost(local.network_bare_metal_shared_ipv4_cidr, 0),
+          cidrhost(local.network_bare_metal_shared_ipv4_cidr, 1),
+          cidrhost(local.network_bare_metal_shared_ipv4_cidr, -1)
+        ], server.private_ipv4)
+      ]
+    ]))
+    error_message = "Bare metal server private_ipv4 values must not use the network address, the first usable IP reserved as the vSwitch gateway, or the broadcast address of the shared bare metal subnet."
+  }
+
+  validation {
+    condition = alltrue([
+      for np in var.bare_metal_nodepools : length(var.cluster_name) + length(np.name) <= 56
+    ])
+    error_message = "The combined length of the cluster name and any bare metal nodepool name must not exceed 56 characters."
+  }
+
+  validation {
+    condition = alltrue([
+      for np in var.bare_metal_nodepools : np.rdns == null || can(regex("^(?:(?:[a-z0-9{} ](?:[a-z0-9-{} ]{0,61}[a-z0-9{} ])?\\.)*(?:[a-z0-9{} ](?:[a-z0-9-{} ]{0,61}[a-z0-9{} ])?))$", np.rdns))
+    ])
+    error_message = "The reverse DNS domain must be a valid domain: each segment must start and end with a letter or number, can contain hyphens, and each segment must be no longer than 63 characters. Supports dynamic substitution with placeholders: {{ cluster-domain }}, {{ cluster-name }}, {{ hostname }}, {{ id }}, {{ ip-labels }}, {{ ip-type }}, {{ pool }}, {{ role }}."
+  }
+
+  validation {
+    condition = alltrue([
+      for np in var.bare_metal_nodepools : np.rdns_ipv4 == null || can(regex("^(?:(?:[a-z0-9{} ](?:[a-z0-9-{} ]{0,61}[a-z0-9{} ])?\\.)*(?:[a-z0-9{} ](?:[a-z0-9-{} ]{0,61}[a-z0-9{} ])?))$", np.rdns_ipv4))
+    ])
+    error_message = "The rdns_ipv4 must be a valid IPv4 reverse DNS domain: each segment must start and end with a letter or number, can contain hyphens, and each segment must be no longer than 63 characters. Supports dynamic substitution with placeholders: {{ cluster-domain }}, {{ cluster-name }}, {{ hostname }}, {{ id }}, {{ ip-labels }}, {{ ip-type }}, {{ pool }}, {{ role }}."
+  }
+
+  validation {
+    condition = alltrue([
+      for np in var.bare_metal_nodepools : np.rdns_ipv6 == null || can(regex("^(?:(?:[a-z0-9{} ](?:[a-z0-9-{} ]{0,61}[a-z0-9{} ])?\\.)*(?:[a-z0-9{} ](?:[a-z0-9-{} ]{0,61}[a-z0-9{} ])?))$", np.rdns_ipv6))
+    ])
+    error_message = "The rdns_ipv6 must be a valid IPv6 reverse DNS domain: each segment must start and end with a letter or number, can contain hyphens, and each segment must be no longer than 63 characters. Supports dynamic substitution with placeholders: {{ cluster-domain }}, {{ cluster-name }}, {{ hostname }}, {{ id }}, {{ ip-labels }}, {{ ip-type }}, {{ pool }}, {{ role }}."
+  }
+}
+
 
 # Cluster Autoscaler
 variable "cluster_autoscaler_helm_repository" {
@@ -452,7 +598,7 @@ variable "cluster_autoscaler_helm_chart" {
 
 variable "cluster_autoscaler_helm_version" {
   type        = string
-  default     = "9.50.1"
+  default     = "9.53.0"
   description = "Version of the Cluster Autoscaler Helm chart to deploy."
 }
 
@@ -462,9 +608,15 @@ variable "cluster_autoscaler_helm_values" {
   description = "Custom Helm values for the Cluster Autoscaler chart deployment. These values will merge with and will override the default values provided by the Cluster Autoscaler Helm chart."
 }
 
+variable "cluster_autoscaler_enabled" {
+  type        = bool
+  default     = false
+  description = "Enables the Cluster Autoscaler deployment."
+}
+
 variable "cluster_autoscaler_image_tag" {
   type        = string
-  default     = "v1.33.4"
+  default     = "v1.34.5"
   description = "Version of the Cluster Autoscaler Image."
 }
 
@@ -476,11 +628,17 @@ variable "cluster_autoscaler_nodepools" {
     labels      = optional(map(string), {})
     annotations = optional(map(string), {})
     taints      = optional(list(string), [])
+    subnet      = optional(string)
     min         = optional(number, 0)
     max         = number
   }))
   default     = []
   description = "Defines configuration settings for Autoscaler node pools within the cluster."
+
+  validation {
+    condition     = var.cluster_autoscaler_enabled || length(var.cluster_autoscaler_nodepools) == 0
+    error_message = "cluster_autoscaler_enabled must be true when cluster_autoscaler_nodepools are configured."
+  }
 
   validation {
     condition     = length(var.cluster_autoscaler_nodepools) == length(distinct([for np in var.cluster_autoscaler_nodepools : np.name]))
@@ -492,6 +650,31 @@ variable "cluster_autoscaler_nodepools" {
       for np in var.cluster_autoscaler_nodepools : np.max >= coalesce(np.min, 0)
     ])
     error_message = "Max size of a nodepool must be greater than or equal to its Min size."
+  }
+
+  validation {
+    condition = length([
+      for np in var.cluster_autoscaler_nodepools : np.subnet if np.subnet != null
+      ]) == length(distinct([
+        for np in var.cluster_autoscaler_nodepools : np.subnet if np.subnet != null
+    ]))
+    error_message = "Cluster Autoscaler nodepool subnets must be unique."
+  }
+
+  validation {
+    condition = alltrue([
+      for np in var.cluster_autoscaler_nodepools : np.subnet == null || contains(local.network_pinned_worker_ipv4_cidrs, np.subnet)
+    ])
+    error_message = "Cluster Autoscaler nodepool subnet must be one of the calculated pinned worker subnets."
+  }
+
+  validation {
+    condition = alltrue([
+      for np in var.cluster_autoscaler_nodepools : np.subnet == null || !contains([
+        for worker_nodepool in var.worker_nodepools : worker_nodepool.subnet
+      ], np.subnet)
+    ])
+    error_message = "Cluster Autoscaler nodepool subnets must not be used by Worker nodepools."
   }
 
   validation {
@@ -521,6 +704,12 @@ variable "cluster_autoscaler_discovery_enabled" {
   type        = bool
   default     = true
   description = "Enable rolling upgrades of Cluster Autoscaler nodes during Talos OS upgrades and Talos configuration changes."
+}
+
+variable "cluster_autoscaler_cleanup_enabled" {
+  type        = bool
+  default     = false
+  description = "Enables cleanup of Hetzner Cloud servers created by Cluster Autoscaler during Terraform destroy. When enabled, matching autoscaler nodes are deleted before managed cluster resources are removed. Warning: disable this option before changing hcloud_token; otherwise Terraform may delete all Cluster Autoscaler nodes."
 }
 
 
@@ -557,18 +746,52 @@ variable "packer_arm64_builder" {
   }
 }
 
+variable "talos_cloud_amd64_image_build_enabled" {
+  type        = bool
+  default     = true
+  description = "Controls whether the module builds a missing Talos AMD64 cloud image with Packer. Disable this only when a suitable snapshot already exists in the Hetzner Cloud project."
+}
+
+variable "talos_cloud_amd64_image_selector" {
+  type        = string
+  default     = "exact"
+  description = "Selects the Talos AMD64 cloud image. 'exact' requires labels matching the cluster, Talos version, and schematic ID. WARNING: 'latest' selects the newest image for the cluster and architecture without matching the Talos version or schematic ID. It is strongly discouraged, entirely unsupported, and not an officially supported mechanism."
+
+  validation {
+    condition     = contains(["exact", "latest"], var.talos_cloud_amd64_image_selector)
+    error_message = "The talos_cloud_amd64_image_selector value must be one of: 'exact' or 'latest'."
+  }
+}
+
+variable "talos_cloud_arm64_image_build_enabled" {
+  type        = bool
+  default     = true
+  description = "Controls whether the module builds a missing Talos ARM64 cloud image with Packer. Disable this only when a suitable snapshot already exists in the Hetzner Cloud project."
+}
+
+variable "talos_cloud_arm64_image_selector" {
+  type        = string
+  default     = "exact"
+  description = "Selects the Talos ARM64 cloud image. 'exact' requires labels matching the cluster, Talos version, and schematic ID. WARNING: 'latest' selects the newest image for the cluster and architecture without matching the Talos version or schematic ID. It is strongly discouraged, entirely unsupported, and not an officially supported mechanism."
+
+  validation {
+    condition     = contains(["exact", "latest"], var.talos_cloud_arm64_image_selector)
+    error_message = "The talos_cloud_arm64_image_selector value must be one of: 'exact' or 'latest'."
+  }
+}
+
 
 # Talos
 variable "talos_version" {
   type        = string
-  default     = "v1.12.7" # https://github.com/siderolabs/talos
+  default     = "v1.13.11" # https://github.com/siderolabs/talos
   description = "Specifies the version of Talos to be used in generated machine configurations."
 }
 
 variable "talos_schematic_id" {
   type        = string
   default     = null
-  description = "Specifies the Talos schematic ID used for selecting the specific Image and Installer versions in deployments. This has precedence over `talos_image_extensions`"
+  description = "Specifies the Talos schematic ID used for selecting cloud image and installer versions. Bare metal servers always use generated metal schematics because their initial network configuration is server-specific. This has precedence over `talos_image_extensions` for cloud servers."
 }
 
 variable "talos_image_extensions" {
@@ -639,6 +862,12 @@ variable "talos_discovery_service_enabled" {
   type        = bool
   default     = true
   description = "Enable or disable Sidero Labs public Talos discovery service."
+}
+
+variable "talos_cri_discard_unpacked_layers" {
+  type        = bool
+  default     = true
+  description = "Determines whether containerd discards unpacked image layers on all Talos nodes. Set to false to retain unpacked image layers. Attention: Changing this value forces all Talos nodes to reboot and should be performed with `talos_machine_configuration_apply_mode = \"staged\"`."
 }
 
 variable "talos_kubelet_extra_mounts" {
@@ -894,10 +1123,10 @@ variable "talos_backup_version" {
   description = "Specifies the version of Talos Backup to be used in generated machine configurations."
 }
 
-variable "talos_backup_s3_enabled" {
+variable "talos_backup_enabled" {
   type        = bool
   default     = true
-  description = "Enable Talos etcd S3 backup cronjob."
+  description = "Enable Talos Backup cronjob."
 }
 
 variable "talos_backup_s3_hcloud_url" {
@@ -972,7 +1201,7 @@ variable "talos_backup_schedule" {
 # Kubernetes
 variable "kubernetes_version" {
   type        = string
-  default     = "v1.33.10" # https://github.com/kubernetes/kubernetes
+  default     = "v1.34.12" # https://github.com/kubernetes/kubernetes
   description = "Specifies the Kubernetes version to deploy."
 }
 
@@ -1088,10 +1317,28 @@ variable "talos_ccm_enabled" {
   description = "Enables the Talos Cloud Controller Manager (CCM) deployment."
 }
 
-variable "talos_ccm_version" {
+variable "talos_ccm_helm_repository" {
   type        = string
-  default     = "v1.12.0" # https://github.com/siderolabs/talos-cloud-controller-manager
-  description = "Specifies the version of the Talos Cloud Controller Manager (CCM) to use. This version controls cloud-specific integration features in the Talos operating system."
+  default     = "oci://ghcr.io/siderolabs/charts"
+  description = "URL of the Helm repository where the Talos CCM chart is located."
+}
+
+variable "talos_ccm_helm_chart" {
+  type        = string
+  default     = "talos-cloud-controller-manager"
+  description = "Name of the Helm chart used for deploying Talos CCM."
+}
+
+variable "talos_ccm_helm_version" {
+  type        = string
+  default     = "0.5.5"
+  description = "Version of the Talos CCM Helm chart to deploy."
+}
+
+variable "talos_ccm_helm_values" {
+  type        = any
+  default     = {}
+  description = "Custom Helm values for the Talos CCM chart deployment. These values will merge with and will override the default values provided by the Talos CCM Helm chart."
 }
 
 # Kubernetes OIDC Configuration
@@ -1210,6 +1457,45 @@ variable "hcloud_token" {
   sensitive   = true
 }
 
+variable "hcloud_robot_user" {
+  type        = string
+  default     = null
+  description = "Hetzner Robot API username used for Robot server support."
+
+  validation {
+    condition     = var.hcloud_robot_user == null || length(var.hcloud_robot_user) > 0
+    error_message = "hcloud_robot_user must not be empty."
+  }
+
+  validation {
+    condition     = (var.hcloud_robot_user == null) == (var.hcloud_robot_password == null)
+    error_message = "hcloud_robot_user and hcloud_robot_password must be configured together."
+  }
+}
+
+variable "hcloud_robot_password" {
+  type        = string
+  default     = null
+  description = "Hetzner Robot API password used for Robot server support. Changing this value recreates Robot resources that use it as a replacement trigger, including a managed vSwitch."
+  sensitive   = true
+
+  validation {
+    condition     = var.hcloud_robot_password == null || length(var.hcloud_robot_password) > 0
+    error_message = "hcloud_robot_password must not be empty."
+  }
+}
+
+variable "hcloud_robot_api_url" {
+  type        = string
+  default     = "https://robot-ws.your-server.de"
+  description = "Hetzner Robot API base URL."
+
+  validation {
+    condition     = can(regex("^https://[^/]+$", var.hcloud_robot_api_url))
+    error_message = "hcloud_robot_api_url must be an HTTPS URL without a trailing slash."
+  }
+}
+
 variable "hcloud_network" {
   type = object({
     id = number
@@ -1229,6 +1515,38 @@ variable "hcloud_network_id" {
   }
 }
 
+variable "hcloud_network_expose_routes_to_vswitch" {
+  type        = bool
+  default     = true
+  description = "Expose Hetzner Cloud Network routes to the vSwitch connection."
+}
+
+variable "hcloud_vswitch_vlan_id" {
+  type        = number
+  default     = 4050
+  description = "Hetzner vSwitch VLAN ID used when creating or looking up a vSwitch by name. When hcloud_vswitch_id is set, the VLAN ID is read from the existing vSwitch."
+
+  validation {
+    condition     = var.hcloud_vswitch_vlan_id == null || (var.hcloud_vswitch_vlan_id >= 4000 && var.hcloud_vswitch_vlan_id <= 4091)
+    error_message = "hcloud_vswitch_vlan_id must be between 4000 and 4091."
+  }
+
+  validation {
+    condition     = var.hcloud_vswitch_id != null || var.hcloud_vswitch_vlan_id != null
+    error_message = "hcloud_vswitch_vlan_id must be set when hcloud_vswitch_id is not provided."
+  }
+}
+
+variable "hcloud_vswitch_id" {
+  type        = number
+  default     = null
+  description = "ID of an existing Hetzner Robot vSwitch to use instead of creating a new one."
+
+  validation {
+    condition     = var.hcloud_vswitch_id == null || var.hcloud_vswitch_id > 0
+    error_message = "hcloud_vswitch_id must be greater than 0."
+  }
+}
 
 # Hetzner Cloud Controller Manager (CCM)
 variable "hcloud_ccm_enabled" {
@@ -1251,7 +1569,7 @@ variable "hcloud_ccm_helm_chart" {
 
 variable "hcloud_ccm_helm_version" {
   type        = string
-  default     = "1.30.1"
+  default     = "1.38.0"
   description = "Version of the Hcloud CCM Helm chart to deploy."
 }
 
@@ -1377,8 +1695,8 @@ variable "hcloud_ccm_load_balancers_uses_proxyprotocol" {
 
 variable "hcloud_ccm_network_routes_enabled" {
   type        = bool
-  default     = true
-  description = "Enable or disable Hetzner Cloud CCM Route Controller"
+  default     = null
+  description = "Enable or disable Hetzner Cloud CCM Route Controller. When omitted, the value is automatically set to false if Bare Metal servers are used. Otherwise it is true."
 }
 
 
@@ -1397,7 +1715,7 @@ variable "hcloud_csi_helm_chart" {
 
 variable "hcloud_csi_helm_version" {
   type        = string
-  default     = "2.20.2"
+  default     = "2.23.0"
   description = "Version of the Hcloud CSI Helm chart to deploy."
 }
 
@@ -1462,7 +1780,7 @@ variable "longhorn_helm_chart" {
 
 variable "longhorn_helm_version" {
   type        = string
-  default     = "1.11.1"
+  default     = "1.12.1"
   description = "Version of the Longhorn Helm chart to deploy."
 }
 
@@ -1506,7 +1824,7 @@ variable "cilium_helm_chart" {
 
 variable "cilium_helm_version" {
   type        = string
-  default     = "1.18.7"
+  default     = "1.20.2"
   description = "Version of the Cilium Helm chart to deploy."
 }
 
@@ -1586,7 +1904,7 @@ variable "cilium_socket_lb_host_namespace_only_enabled" {
 
 variable "cilium_load_balancer_acceleration" {
   type        = string
-  default     = "native"
+  default     = "best-effort"
   description = "Cilium XDP Acceleration mode."
 
   validation {
@@ -1595,14 +1913,20 @@ variable "cilium_load_balancer_acceleration" {
   }
 }
 
+variable "cilium_bpf_host_legacy_routing" {
+  type        = bool
+  default     = null
+  description = "Explicitly enable or disable Cilium's legacy host routing. When omitted, the value is automatically determined and only set to `true` if necessary, for example when IPSec is enabled."
+}
+
 variable "cilium_routing_mode" {
   type        = string
-  description = "Cilium routing mode (e.g., 'native', 'tunnel', etc.)"
-  default     = "native"
+  description = "Cilium routing mode. When omitted, this defaults to tunnel if bare metal servers are enabled, otherwise native."
+  default     = null
 
   validation {
-    condition     = contains(["", "native", "tunnel"], var.cilium_routing_mode)
-    error_message = "cilium_routing_mode must be one of: empty string, native, or tunnel."
+    condition     = var.cilium_routing_mode == null || contains(["native", "tunnel"], var.cilium_routing_mode)
+    error_message = "cilium_routing_mode must be one of: native or tunnel."
   }
 }
 
@@ -1615,11 +1939,6 @@ variable "cilium_bpf_datapath_mode" {
     condition     = contains(["veth", "netkit", "netkit-l2"], var.cilium_bpf_datapath_mode)
     error_message = "cilium_bpf_datapath_mode must be one of: veth, netkit, netkit-l2."
   }
-}
-
-variable "cilium_host_legacy_routing_enabled" {
-  type = bool
-  default = false
 }
 
 variable "cilium_gateway_api_enabled" {
@@ -1706,7 +2025,7 @@ variable "metrics_server_helm_chart" {
 
 variable "metrics_server_helm_version" {
   type        = string
-  default     = "3.13.0"
+  default     = "3.14.0"
   description = "Version of the Metrics Server Helm chart to deploy."
 }
 
@@ -1750,7 +2069,7 @@ variable "cert_manager_helm_chart" {
 
 variable "cert_manager_helm_version" {
   type        = string
-  default     = "v1.20.2"
+  default     = "v1.21.2"
   description = "Version of the Cert Manager Helm chart to deploy."
 }
 
@@ -1764,6 +2083,54 @@ variable "cert_manager_enabled" {
   type        = bool
   default     = false
   description = "Enables the deployment of cert-manager for managing TLS certificates."
+}
+
+
+# Cert Manager Webhook Hetzner
+variable "cert_manager_webhook_hetzner_helm_repository" {
+  type        = string
+  default     = "https://charts.hetzner.cloud"
+  description = "URL of the Helm repository where the Cert Manager Hetzner webhook chart is located."
+}
+
+variable "cert_manager_webhook_hetzner_helm_chart" {
+  type        = string
+  default     = "cert-manager-webhook-hetzner"
+  description = "Name of the Helm chart used for deploying the Cert Manager Hetzner webhook."
+}
+
+variable "cert_manager_webhook_hetzner_helm_version" {
+  type        = string
+  default     = "0.9.0"
+  description = "Version of the Cert Manager Hetzner webhook Helm chart to deploy."
+}
+
+variable "cert_manager_webhook_hetzner_helm_values" {
+  type        = any
+  default     = {}
+  description = "Custom Helm values for the Cert Manager Hetzner webhook chart deployment. These values will merge with and will override the default values provided by the Cert Manager Hetzner webhook Helm chart."
+}
+
+variable "cert_manager_webhook_hetzner_enabled" {
+  type        = bool
+  default     = false
+  description = "Enables the deployment of the Cert Manager Hetzner webhook for ACME DNS-01 challenges using Hetzner DNS."
+
+  validation {
+    condition     = var.cert_manager_webhook_hetzner_enabled ? var.cert_manager_enabled : true
+    error_message = "The Cert Manager Hetzner webhook can only be enabled if cert-manager is also enabled."
+  }
+}
+
+variable "cert_manager_webhook_hetzner_group_name" {
+  type        = string
+  default     = "acme.hetzner.com"
+  description = "API group name used by the Cert Manager Hetzner webhook. Issuer webhook solver configurations must use the same groupName."
+
+  validation {
+    condition     = can(regex("^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.)*(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)$", var.cert_manager_webhook_hetzner_group_name))
+    error_message = "The Cert Manager Hetzner webhook group name must be a valid DNS subdomain."
+  }
 }
 
 
@@ -2058,7 +2425,7 @@ variable "gateway_api_crds_enabled" {
 
 variable "gateway_api_crds_version" {
   type        = string
-  default     = "v1.4.1" # https://github.com/kubernetes-sigs/gateway-api
+  default     = "v1.6.1" # https://github.com/kubernetes-sigs/gateway-api
   description = "Specifies the version of the Gateway API Custom Resource Definitions (CRDs) to deploy."
 }
 
@@ -2083,11 +2450,12 @@ variable "prometheus_operator_crds_enabled" {
 
 variable "prometheus_operator_crds_version" {
   type        = string
-  default     = "v0.90.1" # https://github.com/prometheus-operator/prometheus-operator
+  default     = "v0.94.1" # https://github.com/prometheus-operator/prometheus-operator
   description = "Specifies the version of the Prometheus Operator Custom Resource Definitions (CRDs) to deploy."
 }
 
 variable "on_prem_worker_ipv4_list" {
   type        = list(string)
-  default = []
+  default     = []
+  description = "List of private IPv4 addresses of on-premises worker nodes joined to the cluster outside of Hetzner Cloud. Included in Talos health checks."
 }

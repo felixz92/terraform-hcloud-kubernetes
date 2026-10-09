@@ -25,6 +25,7 @@ output "talosconfig_data" {
 output "talos_client_configuration" {
   description = "Detailed configuration data for the Talos client."
   value       = data.talos_client_configuration.this
+  sensitive   = true
 }
 
 output "talos_machine_secrets" {
@@ -75,6 +76,11 @@ output "worker_public_ipv6_list" {
   value       = local.worker_public_ipv6_list
 }
 
+output "hcloud_vswitch_id" {
+  description = "Hetzner Robot vSwitch ID used for bare metal private networking."
+  value       = local.hcloud_vswitch_id
+}
+
 output "cilium_encryption_info" {
   description = "Cilium traffic encryption settings, including current state and IPsec details if enabled."
   value = {
@@ -105,7 +111,7 @@ output "kube_api_load_balancer" {
 
 output "talos_certificate_san" {
   description = "The certificate SAN for usage in external servers"
-  value = local.talos_certificate_san
+  value       = local.talos_certificate_san
 }
 
 output "network_service_ipv4_cidr" {
